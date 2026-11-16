@@ -1,0 +1,310 @@
+// Casefile — Phase 1 schema.
+// Spine entities only: Tenant, User, Claim, EvidenceItem, CaseFile, ReviewFlag, AuditLogEntry.
+// Party/Asset/Policy/etc. arrive in Phase 3+ — Claim carries claimant/policy as text until then.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TenantType {
+  BROKER
+  TPA
+  CARRIER
+}
+
+enum Role {
+  ORG_ADMIN
+  BROKER_AGENT
+  UNDERWRITER
+  CLAIMS_HANDLER
+  FINANCE
+  PLATFORM_ADMIN
+}
+
+enum ClaimStatus {
+  INTAKE_RECEIVED
+  DOCUMENTS_PENDING
+  SUBMITTED_TO_INSURER
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum EvidenceType {
+  IMAGE
+  PDF
+  AUDIO
+  OTHER
+}
+
+model Tenant {
+  id        String     @id @default(cuid())
+  name      String
+  type      TenantType @default(BROKER)
+  createdAt DateTime   @default(now())
+
+  users         User[]
+  claims        Claim[]
+  evidenceItems EvidenceItem[]
+  caseFiles     CaseFile[]
+  auditEntries  AuditLogEntry[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role     @default(CLAIMS_HANDLER)
+  createdAt    DateTime @default(now())
+
+  tenant           Tenant          @relation(fields: [tenantId], references: [id])
+  claimsCreated    Claim[]         @relation("ClaimCreatedBy")
+  evidenceUploaded EvidenceItem[]
+  caseFilesCreated CaseFile[]
+  auditEntries     AuditLogEntry[]
+
+  @@index([tenantId])
+}
+
+model Claim {
+  id                  String      @id @default(cuid())
+  tenantId            String
+  reference           String
+  claimantName        String
+  policyNumber        String?
+  incidentDate        DateTime?
+  incidentDescription String?
+  intakeRaw           String? // the client's original message, kept verbatim
+  intake              Json? // AI-extracted intake (insurance_type, urgency, risk_flags, ...)
+  status              ClaimStatus @default(INTAKE_RECEIVED)
+  createdById         String
+  clientAccessToken   String?     @unique // gates the client portal link (Feature 1)
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+
+  tenant         Tenant            @relation(fields: [tenantId], references: [id])
+  createdBy      User              @relation("ClaimCreatedBy", fields: [createdById], references: [id])
+  evidenceItems  EvidenceItem[]
+  caseFiles      CaseFile[]
+  stageEvents    ClaimStageEvent[]
+  quotes         Quote[]
+  clientRequests ClientRequest[]
+
+  @@unique([tenantId, reference])
+  @@index([tenantId, status])
+}
+
+// Broker → client requests surfaced in the client portal (Feature 1): a question
+// to answer or a document to upload. The client's reply is captured on `response`.
+enum ClientRequestType {
+  QUESTION
+  DOCUMENT
+}
+
+model ClientRequest {
+  id          String            @id @default(cuid())
+  tenantId    String
+  claimId     String
+  type        ClientRequestType @default(QUESTION)
+  prompt      String
+  response    String?
+  respondedAt DateTime?
+  createdById String
+  createdAt   DateTime          @default(now())
+
+  claim Claim @relation(fields: [claimId], references: [id])
+
+  @@index([claimId])
+}
+
+// Quote Generation Engine (Step 2): a structured, broker-sendable quote derived
+// from Smart Intake data. Pricing is INDICATIVE placeholder logic — no real
+// insurer integration. Additive; does not touch the claim lifecycle.
+model Quote {
+  id                    String    @id @default(cuid())
+  tenantId              String
+  claimId               String
+  insuranceType         String
+  assetValue            String?
+  clientSummary         String
+  riskFlags             Json // string[]
+  recommendedOptions    Json // QuoteOption[]: { name, coverage, premiumRange, recommended }
+  estimatedPremiumRange String
+  assumptions           Json // string[]
+  recommendation        String
+  clientMessage         String // WhatsApp/email-ready text
+  followUpRequired      Boolean   @default(true)
+  followUpDueAt         DateTime?
+  sentAt                DateTime?
+  clientResponse        String? // ACCEPTED | REJECTED (client decision from the portal)
+  clientRespondedAt     DateTime?
+  createdById           String
+  createdAt             DateTime  @default(now())
+
+  claim Claim @relation(fields: [claimId], references: [id])
+
+  @@index([claimId])
+  @@index([tenantId])
+}
+
+// The claim's lifecycle timeline (stage_history): one row per status transition,
+// including the initial INTAKE_RECEIVED at creation. Append-only in practice.
+model ClaimStageEvent {
+  id         String       @id @default(cuid())
+  claimId    String
+  fromStatus ClaimStatus?
+  toStatus   ClaimStatus
+  note       String?
+  actorEmail String
+  createdAt  DateTime     @default(now())
+
+  claim Claim @relation(fields: [claimId], references: [id])
+
+  @@index([claimId, createdAt])
+}
+
+model EvidenceItem {
+  id           String       @id @default(cuid())
+  tenantId     String
+  claimId      String
+  type         EvidenceType
+  fileName     String
+  mimeType     String
+  sizeBytes    Int
+  storageKey   String
+  sha256       String
+  transcript   String? // Phase 2: STT output for audio, always shown as unverified
+  source       String       @default("STAFF") // STAFF | PORTAL (client-uploaded via the portal)
+  uploadedById String
+  createdAt    DateTime     @default(now())
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id])
+  claim      Claim  @relation(fields: [claimId], references: [id])
+  uploadedBy User   @relation(fields: [uploadedById], references: [id])
+
+  @@index([claimId])
+  @@index([tenantId])
+}
+
+model CaseFile {
+  id            String   @id @default(cuid())
+  tenantId      String
+  claimId       String
+  version       Int
+  content       Json // the structured case-file JSON from the engine
+  model         String
+  shareToken    String?  @unique // unguessable token gating the shareable link
+  generatedById String
+  createdAt     DateTime @default(now())
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+  claim       Claim        @relation(fields: [claimId], references: [id])
+  generatedBy User         @relation(fields: [generatedById], references: [id])
+  reviewFlags ReviewFlag[]
+
+  @@unique([claimId, version])
+  @@index([tenantId])
+}
+
+model ReviewFlag {
+  id              String   @id @default(cuid())
+  caseFileId      String
+  summary         String // what the flag is
+  explanation     String // precisely why it was raised — never a bare score
+  evidenceItemIds String[] // EvidenceItem ids that triggered it
+  createdAt       DateTime @default(now())
+
+  caseFile CaseFile @relation(fields: [caseFileId], references: [id])
+
+  @@index([caseFileId])
+}
+
+// Append-only: application code must never update or delete rows here.
+model AuditLogEntry {
+  id         String   @id @default(cuid())
+  tenantId   String
+  actorId    String?
+  actorEmail String
+  action     String // e.g. "claim.created", "claim.status_changed", "case_file.generated"
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  actor  User?  @relation(fields: [actorId], references: [id])
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, createdAt])
+}
+
+// Renewals Engine (Feature 3): a policy that expires and can be renewed.
+// Minimal first-class policy entity (claims still carry policyNumber as text).
+enum PolicyStatus {
+  ACTIVE
+  LAPSED
+  RENEWED
+  CANCELLED
+}
+
+model Policy {
+  id            String       @id @default(cuid())
+  tenantId      String
+  policyNumber  String
+  clientName    String
+  insuranceType String
+  assetValue    String? // stated value, e.g. "USD 12,000" (kept as text, indicative)
+  premium       String? // current premium, e.g. "USD 45 / month"
+  inceptionDate DateTime?
+  expiryDate    DateTime
+  status        PolicyStatus @default(ACTIVE)
+  createdById   String
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  renewals Renewal[]
+
+  @@unique([tenantId, policyNumber])
+  @@index([tenantId, expiryDate])
+}
+
+// A renewal cycle worked by a broker. Created when a broker prepares a renewal;
+// the queue itself is computed from Policy.expiryDate. Nothing is sent to a
+// client without the broker approving first (status APPROVED -> SENT).
+enum RenewalStatus {
+  PENDING
+  DRAFTED
+  APPROVED
+  SENT
+  COMPLETED
+  DECLINED
+}
+
+model Renewal {
+  id           String        @id @default(cuid())
+  tenantId     String
+  policyId     String
+  dueDate      DateTime
+  reminderTier String // D90 | D60 | D30 | DUE | OVERDUE
+  status       RenewalStatus @default(DRAFTED)
+  draftMessage String? // broker-editable client reminder/renewal message
+  quoteRange   String? // indicative renewal premium range
+  approvedAt   DateTime?
+  sentAt       DateTime?
+  createdById  String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  policy Policy @relation(fields: [policyId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([policyId])
+}
